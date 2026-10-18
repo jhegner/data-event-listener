@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lab de eventos DML</title>
+    <style>
+        :root { color-scheme: light; font-family: system-ui, sans-serif; color: #1f2937; background: #f3f5f8; }
+        body { max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }
+        h1 { margin-bottom: .25rem; }
+        .muted { color: #64748b; }
+        .card { background: white; border: 1px solid #e2e8f0; border-radius: 10px; padding: 1rem; margin: 1rem 0; }
+        form { display: flex; flex-wrap: wrap; gap: .6rem; }
+        input, button { font: inherit; padding: .55rem .7rem; border: 1px solid #cbd5e1; border-radius: 6px; }
+        input { flex: 1; min-width: 160px; }
+        button { cursor: pointer; background: #1d4ed8; color: white; border: 0; }
+        button.secondary { background: #475569; }
+        button.danger { background: #b91c1c; }
+        button:focus-visible, input:focus-visible { outline: 3px solid #93c5fd; outline-offset: 2px; }
+        button:disabled { cursor: wait; opacity: .65; }
+        .scroll { overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; text-align: left; }
+        th, td { padding: .55rem; border-bottom: 1px solid #e2e8f0; vertical-align: top; }
+        tr.editing { background: #eff6ff; }
+        code { white-space: pre-wrap; word-break: break-word; }
+        .actions { display: flex; flex-wrap: wrap; gap: .4rem; }
+        .actions button { min-width: 76px; }
+        .status { min-height: 1.5rem; margin-bottom: 0; }
+        .status.error { color: #b91c1c; }
+        .status.success { color: #15803d; }
+        .empty { color: #64748b; text-align: center; }
+    </style>
+</head>
+<body>
+<h1>Laboratorio de eventos DML</h1>
+<p class="muted">CRUD de Produto → eventos PostInsert/PostUpdate/PostDelete do Hibernate → RabbitMQ → consumidor.</p>
+<section class="card">
+    <h2 id="form-title">Novo produto</h2>
+    <form id="produto-form">
+        <input id="produto-nome" placeholder="Nome do produto" required maxlength="255">
+        <input id="produto-preco" type="number" placeholder="Preco" min="0.01" step="0.01" required>
+        <button id="salvar" type="submit">Gravar</button>
+        <button id="cancelar" class="secondary" type="button" hidden>Cancelar edicao</button>
+    </form>
+    <p id="status" class="status muted" aria-live="polite"></p>
+</section>
+<section class="card">
+    <h2>Produtos</h2>
+    <div class="scroll"><table><thead><tr><th>ID</th><th>Nome</th><th>Preco</th><th>Acoes</th></tr></thead>
+        <tbody id="produtos"></tbody></table></div>
+</section>
+<section class="card">
+    <h2>Eventos de persistencia capturados <small id="event-count"></small></h2>
+    <div class="scroll"><table><thead><tr><th>Quando</th><th>Operacao</th><th>Entidade</th><th>Dados</th></tr></thead>
+        <tbody id="eventos"></tbody></table></div>
+</section>
+<section class="card">
+    <h2>Mensagens consumidas do RabbitMQ <small id="message-count"></small></h2>
+    <div class="scroll"><table><thead><tr><th>Recebida em</th><th>Operacao</th><th>Entidade</th><th>Dados</th></tr></thead>
+        <tbody id="mensagens"></tbody></table></div>
+</section>
+<script>
+    const form = document.querySelector("#produto-form");
+    const status = document.querySelector("#status");
+    let editando = null;
+    const formatarData = valor => new Date(valor).toLocaleString("pt-BR");
+    const formatarPreco = valor => Number(valor).toLocaleString("pt-BR", {
+        style: "currency", currency: "BRL"
+    });
+    function mostrarStatus(mensagem, tipo = "") {
+        status.textContent = mensagem;
+        status.className = `status ${tipo}`.trim();
+    }
+    const celula = (linha, valor) => {
+        const td = document.createElement("td");
+        td.textContent = valor ?? "";
+        linha.append(td);
+        return td;
+    };
+    async function requisicao(url, opcoes = {}) {
+        const resposta = await fetch(url, { headers: { "Content-Type": "application/json" }, ...opcoes });
+        if (!resposta.ok) {
+            const detalhe = await resposta.text();
+            throw new Error(detalhe || `HTTP ${resposta.status}`);
+        }
+        return resposta.status === 204 ? null : resposta.json();
+    }
+    function limparFormulario() {
+        editando = null;
+        form.reset();
+        document.querySelector("#form-title").textContent = "Novo produto";
+        document.querySelector("#salvar").textContent = "Gravar";
+        document.querySelector("#cancelar").hidden = true;
+        document.querySelector("#produtos").querySelectorAll("tr.editing")
+            .forEach(linha => linha.classList.remove("editing"));
+    }
+    async function atualizar() {
+        const [produtos, eventos, mensagens] = await Promise.all([
+            requisicao("/api/produtos"), requisicao("/api/eventos"), requisicao("/api/mensagens")
+        ]);
+        const linhasProdutos = document.querySelector("#produtos");
+        linhasProdutos.replaceChildren();
+        if (produtos.length === 0) {
+            const linhaVazia = document.createElement("tr");
+            const mensagem = celula(linhaVazia, "Nenhum produto cadastrado. Use o formulario acima para gravar o primeiro.");
+            mensagem.colSpan = 4;
+            mensagem.className = "empty";
+            linhasProdutos.append(linhaVazia);
+        }
+        produtos.forEach(produto => {
+            const tr = document.createElement("tr");
+            if (produto.id === editando) tr.classList.add("editing");
+            celula(tr, produto.id);
+            celula(tr, produto.nome);
+            celula(tr, formatarPreco(produto.preco));
+            const acoes = celula(tr, "");
+            const grupoAcoes = document.createElement("div");
+            grupoAcoes.className = "actions";
+            const editar = document.createElement("button");
+            editar.className = "secondary";
+            editar.type = "button";
+            editar.textContent = "Editar";
+            editar.setAttribute("aria-label", `Editar produto ${produto.nome}`);
+            editar.onclick = () => {
+                editando = produto.id;
+                document.querySelector("#produto-nome").value = produto.nome;
+                document.querySelector("#produto-preco").value = produto.preco;
+                document.querySelector("#form-title").textContent = `Editar produto #${produto.id}`;
+                document.querySelector("#salvar").textContent = "Atualizar";
+                document.querySelector("#cancelar").hidden = false;
+                mostrarStatus(`Editando "${produto.nome}". Altere os campos e clique em Atualizar.`);
+                atualizar();
+                document.querySelector("#produto-nome").focus();
+            };
+            const excluir = document.createElement("button");
+            excluir.className = "danger";
+            excluir.type = "button";
+            excluir.textContent = "Excluir";
+            excluir.setAttribute("aria-label", `Excluir produto ${produto.nome}`);
+            excluir.onclick = async () => {
+                if (!window.confirm(`Excluir o produto "${produto.nome}" (ID ${produto.id})? Esta acao gera um evento DELETE.`)) {
+                    return;
+                }
+                excluir.disabled = true;
+                try {
+                    await requisicao(`/api/produtos/${produto.id}`, { method: "DELETE" });
+                    if (editando === produto.id) limparFormulario();
+                    mostrarStatus(`Produto "${produto.nome}" excluido. Evento DELETE registrado.`, "success");
+                    await atualizar();
+                } catch (erro) {
+                    mostrarStatus(`Erro ao excluir produto: ${erro.message}`, "error");
+                } finally {
+                    excluir.disabled = false;
+                }
+            };
+            grupoAcoes.append(editar, excluir);
+            acoes.append(grupoAcoes);
+            linhasProdutos.append(tr);
+        });
+        document.querySelector("#event-count").textContent = `(${eventos.length})`;
+        document.querySelector("#eventos").replaceChildren(...eventos.map(evento => {
+            const tr = document.createElement("tr");
+            celula(tr, formatarData(evento.ocorridoEm));
+            celula(tr, evento.operacao);
+            celula(tr, `${evento.entidade} #${evento.entidadeId}`);
+            const dados = celula(tr, evento.dados);
+            dados.innerHTML = "";
+            const code = document.createElement("code");
+            code.textContent = evento.dados;
+            dados.append(code);
+            return tr;
+        }));
+        document.querySelector("#message-count").textContent = `(${mensagens.length})`;
+        document.querySelector("#mensagens").replaceChildren(...mensagens.map(mensagem => {
+            const tr = document.createElement("tr");
+            celula(tr, formatarData(mensagem.recebidoEm));
+            celula(tr, mensagem.operacao);
+            celula(tr, `${mensagem.entidade} #${mensagem.entidadeId}`);
+            const dados = celula(tr, "");
+            const code = document.createElement("code");
+            code.textContent = mensagem.dados;
+            dados.append(code);
+            return tr;
+        }));
+    }
+    form.addEventListener("submit", async evento => {
+        evento.preventDefault();
+        const idEditado = editando;
+        const produto = {
+            nome: document.querySelector("#produto-nome").value,
+            preco: Number(document.querySelector("#produto-preco").value)
+        };
+        const botaoSalvar = document.querySelector("#salvar");
+        botaoSalvar.disabled = true;
+        try {
+            await requisicao(idEditado ? `/api/produtos/${idEditado}` : "/api/produtos", {
+                method: idEditado ? "PUT" : "POST", body: JSON.stringify(produto)
+            });
+            limparFormulario();
+            mostrarStatus(idEditado
+                ? `Produto #${idEditado} atualizado. Evento UPDATE registrado.`
+                : "Produto gravado. Evento INSERT registrado.", "success");
+            await atualizar();
+        } catch (erro) {
+            mostrarStatus(`Erro ao gravar produto: ${erro.message}`, "error");
+        } finally {
+            botaoSalvar.disabled = false;
+        }
+    });
+    document.querySelector("#cancelar").addEventListener("click", () => {
+        limparFormulario();
+        mostrarStatus("Edicao cancelada.");
+    });
+    atualizar().catch(erro => { mostrarStatus(`Erro ao carregar dados: ${erro.message}`, "error"); });
+    setInterval(() => atualizar().catch(erro => {
+        mostrarStatus(`Erro ao atualizar: ${erro.message}`, "error");
+    }), 3000);
+</script>
+</body>
+</html>
